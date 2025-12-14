@@ -1,4 +1,4 @@
-# DeduplicateFiles.ps1 version 1.0.0
+# DeduplicateFiles.ps1 version 1.1.0
 
 param(
     [string[]]$SourceRoots,
@@ -14,7 +14,9 @@ param(
     [string]$LogPath
 )
 
-$script:ScriptVersion = "1.0.0"
+$script:ScriptVersion = "1.1.0"
+$script:LogLock = New-Object object
+$script:ProgressLock = New-Object object
 
 # ----------------------------------------------
 # HELP
@@ -105,10 +107,15 @@ if (-not $LogPath) {
 
 function Write-Log([string]$msg) {
     $line = "$(Get-Date -Format 'yyyy-MM-dd HH:mm:ss') `t $msg"
-    if (-not ($Silent -and -not $VerboseOutput)) {
-        Write-Host $msg
+    [System.Threading.Monitor]::Enter($script:LogLock)
+    try {
+        if (-not ($Silent -and -not $VerboseOutput)) {
+            Write-Host $msg
+        }
+        Add-Content $LogPath $line
+    } finally {
+        [System.Threading.Monitor]::Exit($script:LogLock)
     }
-    Add-Content $LogPath $line
 }
 
 function Write-Detail([string]$msg) {
@@ -195,6 +202,39 @@ function Format-Bytes([long]$bytes) {
         $i++
     }
     return ("{0:N2} {1}" -f $size, $units[$i])
+}
+
+function Format-Duration([TimeSpan]$ts) {
+    return $ts.ToString("hh':'mm':'ss'.'fff")
+}
+
+function Get-FileHashFast {
+    param(
+        [string]$Path,
+        [switch]$NoLog
+    )
+
+    $buffer = New-Object byte[] 1048576
+    $stream = $null
+    $sha = $null
+    try {
+        $stream = [System.IO.File]::Open($Path, [System.IO.FileMode]::Open, [System.IO.FileAccess]::Read, [System.IO.FileShare]::Read)
+        $sha = [System.Security.Cryptography.SHA256]::Create()
+
+        while (($read = $stream.Read($buffer, 0, $buffer.Length)) -gt 0) {
+            $sha.TransformBlock($buffer, 0, $read, $null, $null) | Out-Null
+        }
+        $sha.TransformFinalBlock($buffer, 0, 0) | Out-Null
+        return ([BitConverter]::ToString($sha.Hash).Replace("-", ""))
+    } catch {
+        if (-not $NoLog) {
+            Write-Log "[WARN] Failed to hash $($Path): $($_.Exception.Message)"
+        }
+        return $null
+    } finally {
+        if ($stream) { $stream.Dispose() }
+        if ($sha) { $sha.Dispose() }
+    }
 }
 
 $script:Win32Loaded = $false
@@ -392,6 +432,7 @@ foreach ($root in $SourceRoots) {
 # SCAN FOR FILES (with progress)
 # ----------------------------------------------
 
+$scanSw = [System.Diagnostics.Stopwatch]::StartNew()
 $extensionSet = New-Object 'System.Collections.Generic.HashSet[string]' ([System.StringComparer]::OrdinalIgnoreCase)
 foreach ($pattern in $FilePatterns) {
     $clean = $pattern -replace '^\*\.', ''
@@ -429,6 +470,17 @@ Write-Progress -Id 2 -Activity "Collecting files" -Completed
 Write-Progress -Id 1 -Activity "Scanning for files" -Completed
 
 $allFiles = $allFiles | Sort-Object -Property FullName -Unique
+
+# Skip zero-byte files to avoid creating empty masters/aliases
+$zeroFiles = @()
+if ($allFiles.Count -gt 0) {
+    $zeroFiles = $allFiles | Where-Object { $_.Length -eq 0 }
+    if ($zeroFiles.Count -gt 0) {
+        $allFiles = $allFiles | Where-Object { $_.Length -gt 0 }
+        Write-Log "[INFO] Skipping $($zeroFiles.Count) zero-byte file(s); they will not be added to the library or deduped."
+    }
+}
+
 $totalFiles = $allFiles.Count
 
 if ($totalFiles -eq 0) {
@@ -437,28 +489,65 @@ if ($totalFiles -eq 0) {
 }
 
 Write-Log "Found $totalFiles files."
+$scanSw.Stop()
+
+# HASHING (single-threaded)
+# ----------------------------------------------
+$hashSw = [System.Diagnostics.Stopwatch]::StartNew()
+$hashTotal = $allFiles.Count
+$hashErrors = 0
+$hashResults = New-Object System.Collections.Generic.List[pscustomobject]
+$hashed = 0
+
+foreach ($file in $allFiles) {
+    $hash = Get-FileHashFast -Path $file.FullName
+    if (-not $hash) {
+        $hashErrors++
+        continue
+    }
+    $hashResults.Add([pscustomobject]@{
+        File = $file
+        Hash = $hash
+    }) | Out-Null
+    $hashed++
+    if (($hashed % 25) -eq 0 -or $hashed -eq $hashTotal) {
+        $percent = [int](($hashed / [math]::Max($hashTotal,1)) * 100)
+        $status = "{0}/{1}" -f $hashed, $hashTotal
+        Write-Progress -Id 3 -Activity "Hashing files" -Status $status -PercentComplete $percent
+    }
+}
+Write-Progress -Id 3 -Activity "Hashing files" -Completed
+
+if ($hashErrors -gt 0) {
+    Write-Log "[WARN] Failed to hash $hashErrors file(s); they were skipped."
+}
+
+$hashedItems = @($hashResults) | Sort-Object -Property @{Expression = { $_.File.FullName }}
+$totalHashed = $hashedItems.Count
+if ($totalHashed -eq 0) {
+    $hashSw.Stop()
+    Write-Log "No files were successfully hashed."
+    exit 1
+}
+$hashSw.Stop()
 
 # ----------------------------------------------
 # DEDUPLICATION ENGINE
 # ----------------------------------------------
 
+$dedupSw = [System.Diagnostics.Stopwatch]::StartNew()
 $hashToMaster = @{}
 $index = 0
 $dedupedCount = 0
 $spaceSavedBytes = [int64]0
 
-foreach ($file in $allFiles) {
-    $index++
-    $status = "{0}/{1} | deduped {2} | saved {3}" -f $index, $totalFiles, $dedupedCount, (Format-Bytes $spaceSavedBytes)
-    Write-Progress -Activity "Hashing and comparing" -Status $status -PercentComplete (($index / $totalFiles) * 100)
+foreach ($entry in $hashedItems) {
+    $file = $entry.File
+    $hash = $entry.Hash
 
-    # Compute hash
-    try {
-        $hash = (Get-FileHash -LiteralPath $file.FullName -Algorithm SHA256).Hash
-    } catch {
-        Write-Log "[WARN] Failed to hash $($file.FullName) - skipping"
-        continue
-    }
+    $index++
+    $status = "{0}/{1} | deduped {2} | saved {3}" -f $index, $totalHashed, $dedupedCount, (Format-Bytes $spaceSavedBytes)
+    Write-Progress -Id 4 -Activity "Deduplicating" -Status $status -PercentComplete (($index / [math]::Max($totalHashed,1)) * 100)
 
     # Unique file?
     if (-not $hashToMaster.ContainsKey($hash)) {
@@ -577,8 +666,12 @@ foreach ($file in $allFiles) {
     }
 }
 
+Write-Progress -Id 4 -Activity "Deduplicating" -Completed
+$dedupSw.Stop()
+
 Write-Log "DONE."
 Write-Log "Deduped $dedupedCount file(s); space saved: $(Format-Bytes $spaceSavedBytes)."
+Write-Log ("[TIME] Scan: {0} | Hash: {1} | Dedup: {2}" -f (Format-Duration $scanSw.Elapsed), (Format-Duration $hashSw.Elapsed), (Format-Duration $dedupSw.Elapsed))
 if ($DryRun) { Write-Log "Dry-run only - no changes were made." }
 Write-Host "Press any key to close..."
 [void][System.Console]::ReadKey($true)
